@@ -1,10 +1,17 @@
+import bisect
 from collections import Counter
 import itertools as it
 import timeit
 
 die = ((1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (5, 1))
 nside = len(die)
-face_to_ind = {die[I1]:I1 for I1 in range(nside)}
+face_to_ind = {die[I1]: I1 for I1 in range(nside)}
+
+tile_costs = ((21, 1), (22, 1), (23, 1), (24, 1), (25, 1), (26, 1), (27, 1), (28, 1),
+              (29, 1), (30, 1), (31, 1), (32, 1), (33, 1), (34, 1), (35, 1), (36, 1))
+
+tile_values = (1, ) * 4 + (2, ) * 4 + (3, ) * 4 + (4, ) * 4
+max_points = max(tile_values)
 
 class DieStats:
     def __init__(self):
@@ -36,6 +43,7 @@ class DecisionNode:
 
         self.parent = parent
         self.children = []
+        self.child_labels = []
 
         self.state_master = state_master
         self.shared_stats = shared_stats
@@ -72,7 +80,13 @@ class DecisionNode:
                 self.state_master[new_ID] = state_node
                 self.shared_stats["n_state_nodes"] += 1
             self.children[-1].parents.append(self)
+            self.child_labels.append(str(play))
 
+    def dice_state_counts(self):
+        counts = [0 for _ in range(nside)]
+        for die in self.dice_state:
+            counts[face_to_ind[die]] += 1
+        return tuple(counts)
 
 class StateNode:
     def __init__(self, n_dice, current_totals=None, parents=None, die_stats=None, state_master=None, shared_stats=None):
@@ -92,6 +106,7 @@ class StateNode:
 
         # Insert node pointer into the master list of state nodes
         self.ID = (self.n_dice, tuple(self.current_totals))
+        self.ID2 = tuple(self.current_totals)
         self.state_master[self.ID] = self
 
         self.children = []
@@ -100,11 +115,6 @@ class StateNode:
         assert self.die_stats is not None
 
         self.initalize_children()
-
-        #===============================================================================================================
-        #== Sniper Variables ===========================================================================================
-        # ===============================================================================================================
-        self.p_target = None
 
     def initalize_children(self):
         outcomes = self.die_stats.get_dist(self.n_dice)
@@ -123,28 +133,64 @@ class StateNode:
         counts = sum([self.current_totals[I1] * die[I1][0] for I1 in range(nside)])
         return counts, worm
 
-    def calculate_p_target(self, target, cache=None):
+    def calculate_strategy(self, mode, input_val, cache=None, decision_cache=None):
+        # ==============================================================================================================
+        # == Input Modes ===============================================================================================
+        # ==============================================================================================================
+        #   1:  Sniper - Try to hit target value.
+        #           input_val = target
+        #   2:  Threshold - Try to hit at or above a set threshold.
+        #           input_val = threshold
+        #   3:  Expectation - Maximize expectation value of points
+        #           input_val = cost of "bust"
         if cache is None:
             cache = {}
-        if self.calculate_value() == target:
-            return 1.
 
-        if self.ID in cache:
-            return cache[self.ID]
+        if self.ID2 in cache:
+            return cache[self.ID2]
+
+        if decision_cache is None:
+            decision_cache = {}
+
+        pass_value = 0.
+        bust_cost = 0.
+        if mode == 3:
+            bust_cost = input_val
+            pass_value = input_val
+        current_value = self.calculate_value()
+        if mode == 1 and current_value[1] > 0 and current_value == input_val:
+            return 1.
+        elif mode == 2 and current_value[1] > 0 and current_value >= input_val:
+            return 1.
+        elif mode == 3 and current_value[1] > 0:
+            best_ind = bisect.bisect_right(tile_costs, (current_value[0], max_points))
+            if best_ind > 0:
+                pass_value = tile_values[best_ind - 1]
 
         total_p = 0.
+        choice = ""
+        decision_by_outcome = {}
         for child in self.children:
-            options = [0]
-            for decision in child.children:
-                options.append(child.connection_p * decision.calculate_p_target(target=target, cache=cache))
-            total_p += max(options)
+            options = [(bust_cost, "bust")]
+            for I1, decision in enumerate(child.children):
+                options.append((decision.calculate_strategy(mode=mode, input_val=input_val,
+                                                           cache=cache, decision_cache=decision_cache), child.child_labels[I1]))
+            choice = max(options)
+            total_p += child.connection_p * choice[0]
+            decision_by_outcome[child.dice_state_counts()] = choice[1]
 
-        cache[self.ID] = total_p
-        return total_p
+        best_outcome = max([total_p, pass_value])
+        cache[self.ID2] = best_outcome
+        if total_p >= pass_value:
+            decision_cache[self.ID2] = (decision_by_outcome, best_outcome)
+        else:
+            decision_cache[self.ID2] = ("pass", best_outcome)
+        return best_outcome
 
 class BruteForceTree:
     def __init__(self, n_dice=8):
         st = timeit.default_timer()
+        self.n_dice = n_dice
         self.die_stats = DieStats()
         self.state_master = {}
         self.shared_stats = {
@@ -167,20 +213,48 @@ class BruteForceTree:
             self.states_by_level[node.depth()].append(node)
 
     def snipe_target(self, target):
-        return self.head.calculate_p_target(target=(target,1))
+        decision_cache = {}
+        return self.head.calculate_strategy(mode=1, input_val=(target, 1), decision_cache=decision_cache)
+
+    def maximize_expectation(self, bust_cost):
+        decision_cache = {}
+        outcome = self.head.calculate_strategy(mode=3, input_val=bust_cost, decision_cache=decision_cache)
+        return outcome, decision_cache
+
+    def get_strategy(self):
+        decision_caches = {}
+        try:
+            while True:
+
+                run = input("Run turn? ")
+                if run.lower() not in ("y", "yes"):
+                    break
+                bust_cost = input("  Cost on bust: ")
+                bust_cost = int(bust_cost)
+                if bust_cost not in decision_caches:
+                    _, decision_caches[bust_cost] = self.maximize_expectation(bust_cost)
+
+                current_counts = [0 for _ in range(nside)]
+                while True:
+                    cc = tuple(current_counts)
+                    if decision_caches[bust_cost][cc] == "pass":
+                        print("You should pass")
+                        break
+
+                    roll_counts = input("Roll counts: ")
+                    roll_counts = tuple(int(m) for m in roll_counts.split())
+
+                    expectation = decision_caches[bust_cost][cc][1]
+                    choice = decision_caches[bust_cost][cc][0][roll_counts]
+                    print("Expectation: {}".format(expectation))
+                    print("Engine choice: {}".format(choice))
+
+
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
     bf_tree = BruteForceTree()
-
-    x = []
-    y = []
-    for i1 in range(21, 41+1):
-        x.append(i1)
-        y.append(bf_tree.snipe_target(i1))
-        print(x[-1], y[-1])
-
-    from matplotlib import pyplot as plt
-    plt.plot(x, y, ".:k")
-    plt.show()
+    bf_tree.get_strategy()
 
